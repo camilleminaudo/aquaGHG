@@ -1,113 +1,169 @@
-#' Automatic bubble detection
+#' Detect Ebullition Events in Floating Chamber CH4 Time Series
 #'
-#' Local variance of gas measurements within a moving window is calculated and
-#' allows for the identification of probable ebullition events.
-#' This function is mainly used by \code{flux.separator()}
+#' Identifies putative methane (CH4) ebullition events in floating chamber
+#' incubation time series by detecting sustained periods of elevated
+#' short-term variance relative to background diffusive dynamics.
 #'
-#' @param time vector; elapsed time over a given incubation.
-#' @param conc vector; gas measurements of same length as \code{time}.
-#' @param window.size integer; the size of the moving window used to calculate
-#' variance.
+#' The algorithm assumes that:
+#' \itemize{
+#'   \item Diffusive flux produces a smooth, low-variance concentration increase.
+#'   \item Ebullition produces abrupt concentration jumps, generating
+#'         locally elevated variance.
+#' }
 #'
-#' @return a data.frame with chunks of elevated variance likely due to ebullition events.
+#' Detection is performed by:
+#' \enumerate{
+#'   \item Robust standardization of the concentration time series.
+#'   \item Linear interpolation to a regular time grid.
+#'   \item Computation of rolling-window variance.
+#'   \item Thresholding using an empirical variance quantile.
+#'   \item Grouping contiguous high-variance windows into bubbling events.
+#'   \item Merging temporally close events.
+#'   \item Removing short-duration events.
+#' }
 #'
-#' @seealso See also the function \code{flux.separator()} and
-#' \code{plot.incubations()} for more information about usage.
+#' @param time Numeric vector of elapsed time (seconds).
+#'   Must be monotonic (duplicates are removed internally).
 #'
+#' @param conc Numeric vector of CH4 concentrations corresponding to `time`
+#'   (e.g., ppm, ppb, or µmol mol-1). Units do not affect detection
+#'   because the algorithm operates on standardized values.
 #'
+#' @param window.size Integer.
+#'   Width of the rolling variance window (in number of interpolated time steps).
+#'   Controls the temporal scale of detectable bubbling events.
+#'
+#' @param dt Numeric.
+#'   Interpolation time step (seconds). Default is 1.
+#'   Smaller values increase temporal resolution but may amplify noise.
+#'
+#' @param var.quantile Numeric in (0,1).
+#'   Empirical quantile used to derive the variance threshold.
+#'   The threshold equals:
+#'   \deqn{Q_{var.quantile}(Var_w)}
+#'   where \eqn{Var_w} is the rolling variance of the standardized series.
+#'   Larger values yield more conservative detection.
+#'
+#' @param min_gap Numeric.
+#'   Maximum time gap (seconds) between adjacent high-variance segments
+#'   to be merged into a single bubbling event.
+#'
+#' @param min_length Numeric.
+#'   Minimum duration (seconds) required for a segment to be classified
+#'   as an ebullition event.
+#'
+#' @return
+#' A data.frame with columns:
+#' \describe{
+#'   \item{start}{Start time (seconds) of detected ebullition event.}
+#'   \item{end}{End time (seconds) of detected ebullition event.}
+#' }
+#' Returns NULL if no bubbling events are detected.
+#'
+#' @details
+#' This method implements a variance-based regime classification approach,
+#' separating high-frequency concentration instability (ebullition)
+#' from smooth diffusive accumulation.
+#'
+#' The detection threshold is data-adaptive, making the method robust
+#' across systems with differing background flux magnitudes.
+#'
+#' Users are encouraged to evaluate sensitivity to `window.size` and
+#' `var.quantile`, as these parameters control temporal resolution and
+#' detection conservativeness.
+#'
+#' @section Assumptions:
+#' \itemize{
+#'   \item Ebullition events manifest as short-term variance increases.
+#'   \item Background diffusion is locally smooth relative to bubbling.
+#'   \item Interpolation does not distort event structure.
+#' }
+#'
+#' @section Recommended practice:
+#' Perform sensitivity analysis across multiple `var.quantile` values
+#' and visually inspect detected events against raw time series.
 #'
 #' @examples
-#' bubbles <- find_bubbles(time = mydata$Etime,
-#'                         conc = mydata$CH4dry_ppb, window.size = 10)
+#' # Example:
+#' # chunks <- find_bubbles(time, conc, window.size = 30)
 #'
 #' @export
-find_bubbles <- function(time, conc, window.size){
+find_bubbles <- function(time,
+                         conc,
+                         window.size,
+                         dt = 1,
+                         var.quantile = 0.7,
+                         min_gap = 10,
+                         min_length = 5) {
 
-  is_dupl_time <- duplicated(time)
-  time <- time[!is_dupl_time]
-  conc <- conc[!is_dupl_time]
+  # --- sort and remove duplicates
+  ord <- order(time)
+  time <- time[ord]
+  conc <- conc[ord]
 
-  # standarizing conc
-  # conc_std <- (conc-min(conc))/(max(conc)-min(conc))
-  conc_std <- conc/mean(conc)
-
-
-  x = seq(min(time),max(time),1)
-  conc_std <- approx(x = time, conc_std, xout = x, method = "linear", rule = 2)$y
-
-
-  # defining start and end for moving window
-  t_start <- x[1]+ceiling(window.size/2)
-  t_stop <- max(time)-floor(window.size/2)
-
-  # computing variance of conc_std with a moving window
-  df.stats <- NULL
-  for(t in seq(t_start, floor(t_stop),1)){
-    ind_window <- which(x>=t-floor(window.size/2) & x<=t+floor(window.size/2))
-    df.stats <- rbind(df.stats, data.frame(t = t,
-                                           var = var(conc_std[ind_window])))
+  dup <- duplicated(time)
+  if (any(dup)) {
+    warning("Duplicated time values detected; keeping first occurrence.")
+    time <- time[!dup]
+    conc <- conc[!dup]
   }
 
-  # defining threshold
-  thresh <- max(1e-4, quantile(df.stats$var, 0.7))
+  # --- scaling
+  conc_std <- (conc - median(conc)) / mad(conc)
 
-  # finding chunks with high variance
-  vect <- df.stats$var > thresh
+  # --- interpolation
+  x <- seq(min(time), max(time), by = dt)
+  conc_interp <- approx(time, conc_std,
+                        xout = x,
+                        method = "linear",
+                        rule = 2)$y
 
-  #initializing
-  chunks <- NULL
-  if(sum(vect)>0){ # in that case, there are some possible bubbling events to check
+  # --- rolling variance
+  roll_var <- zoo::rollapply(conc_interp,
+                             width = window.size,
+                             FUN = var,
+                             align = "center",
+                             fill = NA)
 
-    jumps <- NULL
-    if(vect[1]==T){jumps <- c(1)}
-    for(i in seq(2,length(vect))){
-      if(vect[i] != vect[i-1]){
-        jumps <- c(jumps, i)
+  # --- threshold
+  thresh <- max(1e-4,
+                quantile(roll_var, var.quantile, na.rm = TRUE))
+
+  high_var <- roll_var > thresh
+  high_var[is.na(high_var)] <- FALSE
+
+  if (!any(high_var)) return(NULL)
+
+  # --- find contiguous chunks
+  r <- rle(high_var)
+  ends <- cumsum(r$lengths)
+  starts <- ends - r$lengths + 1
+
+  chunks <- data.frame(
+    start = x[starts[r$values]],
+    end   = x[ends[r$values]]
+  )
+
+  # --- merge close chunks
+  if (nrow(chunks) > 1) {
+    merged <- chunks[1, , drop = FALSE]
+
+    for (i in 2:nrow(chunks)) {
+      gap <- chunks$start[i] - merged$end[nrow(merged)]
+      if (gap <= min_gap) {
+        merged$end[nrow(merged)] <- chunks$end[i]
+      } else {
+        merged <- rbind(merged, chunks[i, ])
       }
     }
-    if(last(vect)==T){jumps <- c(jumps, i)}
-    chunks <- data.frame(start = jumps[seq(1,length(jumps),2)],
-                         end = jumps[seq(2,length(jumps),2)])
-
-    # if there is less than 10 seconds from one chunk to the next, we group them
-    if(dim(chunks)[1]>1){
-      gap <- NA*chunks$start
-
-      chunks_grouped <- chunks[1,]
-      for(i in seq(2,length(chunks$start))){
-        gap <- (chunks$start[i]-chunks$end[i-1])
-
-        if (gap > 10){
-          chunks_grouped <- rbind(chunks_grouped, chunks[i,])
-        } else {
-          j = dim(chunks_grouped)[1]
-          chunks_grouped$end[j] <- chunks$end[i]
-        }
-      }
-      chunks <- chunks_grouped
-    }
-
-    # we discard chunks of less than 5 datapoints
-    chunks <- chunks[which(chunks$end-chunks$start > 5),]
-
-    if(dim(chunks)[1] == 0){
-      chunks <- NULL
-    }
-
-    # p1 <- ggplot(data = data.frame(time = time, conc = conc, conc_std = conc_std))+geom_path(aes(time, conc))+theme_bw()+xlim(c(0,600))+
-    #   xlab("Elapsed time")+ylab("CH4dry [ppb]")+
-    #   annotate("rect", fill = "red", alpha = 0.25,
-    #            xmin = chunks$start, xmax = chunks$end,
-    #            ymin = rep(-Inf, dim(chunks)[1]), ymax = rep(Inf, dim(chunks)[1]))
-    # p2 <- ggplot(data = df.stats)+geom_path(aes(t, var))+theme_bw()+
-    #   xlab("Elapsed time")+ylab("Local variance")+
-    #   ggtitle(paste0("threshold = ",thresh))+xlim(c(0,600))+
-    #   annotate("rect", fill = "red", alpha = 0.25,
-    #            xmin = chunks$start, xmax = chunks$end,
-    #            ymin = rep(-Inf, dim(chunks)[1]), ymax = rep(Inf, dim(chunks)[1]))
-    #
-    # ggarrange(p1,p2, ncol = 1, align = "v")
+    chunks <- merged
   }
+
+  # --- discard short chunks
+  chunks <- chunks[(chunks$end - chunks$start) > min_length, ]
+
+  if (nrow(chunks) == 0) return(NULL)
+
   return(chunks)
 }
 
